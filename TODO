@@ -1,0 +1,5 @@
+  Handle nick changes
+  Print RX lines on request
+  Work out how to remove made fifos when os.Exit is called
+    A goroutine that does the starting of openssl, all goroutines can signal
+        main to exit.
