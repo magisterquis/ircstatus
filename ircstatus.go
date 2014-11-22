@@ -144,33 +144,44 @@ func main() {
 	pname := "" /* Pipe name */
 	switch *gc.pipe {
 	case "-": /* stdin */
+		debug("Taking input from stdin")
 		gc.ipipe = textproto.NewReader(bufio.NewReader(os.Stdin))
 	case "nick": /* Name based on nick */
+		debug("Pipe based on nick")
 		pname = path.Join(os.TempDir(), *gc.nick) /* /tmp/nick */
 		fallthrough
 	default: /* User supplied name */
 		if "" == pname { /* Didn't fallthrough */
 			pname = *gc.pipe
 		}
+		debug("Pipe name: %v", pname)
 		/* Check and see if one exists */
 		fi, err := os.Stat(pname)
 		/* Nothing there */
 		if os.IsNotExist(err) {
+			debug("Pipe does not already exist, creating pipe")
 			if err := syscall.Mkfifo(pname, 0644); err != nil {
 				log.Printf("Unable to make %v: %v", pname, err)
 				os.Exit(-3)
 			}
+			/* Clean up fifo before we exit */
+			defer os.Remove(pname)
 		}
+		/* Check and see if one exists */
+		fi, err = os.Stat(pname)
 		/* Have a named pipe already */
 		if err == nil && (fi.Mode()&os.ModeNamedPipe != 0) {
+			debug("Pipe %v (now) exists", pname)
 			/* Try to open the file */
-			f, e := os.Open(pname)
+			f, e := os.OpenFile(pname, os.O_RDWR, 0600)
 			if e != nil {
 				log.Printf("Unable to open pipe named %v: %v",
 					pname, e)
 				os.Exit(-1)
 			}
 			gc.ipipe = textproto.NewReader(bufio.NewReader(f))
+			go keepPipeOpen(pname)
+			break
 		}
 		/* Something else is there */
 		log.Printf("Unable to use %v for input", pname)
@@ -182,6 +193,7 @@ func main() {
 		/* Command to use to connect to server */
 		cmd := exec.Command("openssl", "s_client", "-quiet",
 			"-connect", gc.addr)
+		debug("Connection command: %v %v", cmd.Path, cmd.Args)
 
 		/* Get ahold of i/o pipes */
 		stdin, err := cmd.StdinPipe()
