@@ -39,6 +39,7 @@ import (
 	"os/exec"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -309,7 +310,7 @@ func sender(p *textproto.Reader, w *textproto.Writer, wg *sync.WaitGroup) {
 func waiter(c *exec.Cmd, wg *sync.WaitGroup) {
 	debug("Started waiter")
 	defer wg.Done()
-	if err := cmd.Wait(); err != nil {
+	if err := c.Wait(); err != nil {
 		log.Printf("openssl exited badly: %v", err)
 	}
 }
