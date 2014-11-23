@@ -3,4 +3,4 @@
   Work out how to remove made fifos when os.Exit is called
     A goroutine that does the starting of openssl, all goroutines can signal
         main to exit.
-  Auth to services
++ Auth to services
