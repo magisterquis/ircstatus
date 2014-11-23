@@ -75,7 +75,8 @@ var gc struct {
 	ipipe *textproto.Reader /* Pipe from which to read */
 }
 
-func main() {
+func main() { os.Exit(mymain()) }
+func mymain() int {
 	/* Get local hostname for flag default */
 	n, err := os.Hostname()
 	gc.nick = &n
@@ -141,6 +142,28 @@ func main() {
 	gc.addr = net.JoinHostPort(*gc.host, fmt.Sprintf("%v", *gc.port))
 	debug("Will connect to %v", gc.addr)
 
+	/* Work out whether we should auth to services */
+	if "" != *gc.idnick || "" != *gc.idpass {
+		/* Get the nick to use */
+		if "" == *gc.idnick {
+			*gc.idnick = *gc.nick
+		}
+		verbose("Auth nick: %v", *gc.idnick)
+		/* Get a password */
+		if "" == *gc.idpass {
+			p, err := bufio.NewReader(
+				os.Stdin).ReadString("\n")
+			if err != nil {
+				log.Printf("Unable to read password to auth "+
+					"to services: %v", err)
+				return -5
+			}
+			gc.idpass = &p
+		}
+		debug("Auth password: %v", *gc.idpass)
+	}
+	/* TODO: defer remove of created pipe, don't use os.Exit() */
+
 	/* Open the pipe */
 	pname := "" /* Pipe name */
 	switch *gc.pipe {
@@ -163,7 +186,7 @@ func main() {
 			debug("Pipe does not already exist, creating pipe")
 			if err := syscall.Mkfifo(pname, 0644); err != nil {
 				log.Printf("Unable to make %v: %v", pname, err)
-				os.Exit(-3)
+				return -3
 			}
 			/* Clean up fifo before we exit */
 			defer os.Remove(pname)
@@ -178,14 +201,14 @@ func main() {
 			if e != nil {
 				log.Printf("Unable to open pipe named %v: %v",
 					pname, e)
-				os.Exit(-1)
+				return -1
 			}
 			gc.ipipe = textproto.NewReader(bufio.NewReader(f))
 			break
 		}
 		/* Something else is there */
 		log.Printf("Unable to use %v for input", pname)
-		os.Exit(-2)
+		return -2
 	}
 
 	/* Main program loop */
@@ -239,7 +262,11 @@ func main() {
 		}
 
 		/* Auth to services */
-
+		if "" != *gc.idnick && "" != *gc.idpass {
+			verbose("Authenticating to services")
+			w.PrintfLine("PRIVMSG nickserv :identify %v %v",
+				*gc.idnick, *gc.idpass)
+		}
 		/* Join Channel */
 		c := fmt.Sprintf("JOIN %v %v", *gc.channel, *gc.chanpass)
 		debug("Joining channel: %v", c)
@@ -264,7 +291,7 @@ func main() {
 		for i := 0; i < 3; i++ {
 			if n := <-dc; -1 == n {
 				/* Something bad happened */
-				return
+				return -4
 			}
 		}
 
@@ -307,7 +334,7 @@ func sender(p *textproto.Reader, w *textproto.Writer, dc chan int) {
 				/* TODO: Work out if we really need to exit */
 				log.Printf("Error getting line to send: %v",
 					err)
-				dc <- -1
+				dc <- 0
 				return
 			}
 			/* Remove needless whitespace */
