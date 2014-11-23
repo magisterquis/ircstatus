@@ -151,13 +151,16 @@ func mymain() int {
 		verbose("Auth nick: %v", *gc.idnick)
 		/* Get a password */
 		if "" == *gc.idpass {
+			/* Try to read a line from stdin */
 			p, err := bufio.NewReader(
-				os.Stdin).ReadString("\n")
+				os.Stdin).ReadString('\n')
 			if err != nil {
 				log.Printf("Unable to read password to auth "+
 					"to services: %v", err)
 				return -5
 			}
+			/* Remove trailing newlines */
+			p = strings.TrimRight(p, "\r\n")
 			gc.idpass = &p
 		}
 		debug("Auth password: %v", *gc.idpass)
