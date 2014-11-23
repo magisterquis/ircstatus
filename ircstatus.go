@@ -39,7 +39,6 @@ import (
 	"os/exec"
 	"path"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -97,10 +96,12 @@ func main() {
 	gc.uname = flag.String("uname", "ircstatus", "Username")
 	gc.rname = flag.String("rname", "Status over IRC", "Real name")
 	gc.idnick = flag.String("idnick", "", "Nick to use to auth to "+
-		"services")
+		"services.  If this is not specified but idpass is, the nick "+
+		"given by -nick or the nick derived from the hostname will "+
+		"be used")
 	gc.idpass = flag.String("idpass", "", "Pass to use to auth to "+
 		"services.  If this is not specified and but idnick is, the "+
-		"password will be read from the standard input.")
+		"password will be read from the standard input")
 	gc.channel = flag.String("channel", "##ircstatushub", "Channel to "+
 		"join")
 	gc.chanpass = flag.String("chanpass", "hunter2", "Channel "+
@@ -140,7 +141,7 @@ func main() {
 	gc.addr = net.JoinHostPort(*gc.host, fmt.Sprintf("%v", *gc.port))
 	debug("Will connect to %v", gc.addr)
 
-	/* Open :he pipe */
+	/* Open the pipe */
 	pname := "" /* Pipe name */
 	switch *gc.pipe {
 	case "-": /* stdin */
@@ -180,7 +181,6 @@ func main() {
 				os.Exit(-1)
 			}
 			gc.ipipe = textproto.NewReader(bufio.NewReader(f))
-			go keepPipeOpen(pname)
 			break
 		}
 		/* Something else is there */
@@ -238,6 +238,8 @@ func main() {
 			continue
 		}
 
+		/* Auth to services */
+
 		/* Join Channel */
 		c := fmt.Sprintf("JOIN %v %v", *gc.channel, *gc.chanpass)
 		debug("Joining channel: %v", c)
@@ -251,24 +253,29 @@ func main() {
 		/* Tell interested users we've sent initial messages */
 		verbose("Set nick and user and sent request to join channel")
 
-		/* Wait on ALL the goroutines */
-		var wg sync.WaitGroup
+		/* Channel to communicate death */
+		dc := make(chan int) /* 0 for ok, -1 for die */
 
-		wg.Add(3)
-		go reader(r, w, &wg) /* DEBUG */
-		go sender(gc.ipipe, w, &wg)
-		go waiter(cmd, &wg)
-		wg.Wait()
+		go reader(r, w, dc) /* DEBUG */
+		go sender(gc.ipipe, w, dc)
+		go waiter(cmd, dc)
 
-		/* Wait for openssl to die */
+		/* Wait for goroutines to end */
+		for i := 0; i < 3; i++ {
+			if n := <-dc; -1 == n {
+				/* Something bad happened */
+				return
+			}
+		}
+
+		/* Don't reconnect too fast */
 		sleep()
 	}
 }
 
 /* Goroutine to handle incoming messages */
-func reader(r *textproto.Reader, w *textproto.Writer, wg *sync.WaitGroup) {
+func reader(r *textproto.Reader, w *textproto.Writer, dc chan int) {
 	debug("Starting reader")
-	defer wg.Done()
 	/* Read lines until an error */
 	for {
 		/* Get a line */
@@ -277,6 +284,7 @@ func reader(r *textproto.Reader, w *textproto.Writer, wg *sync.WaitGroup) {
 		if err != nil {
 			/* TODO: Make this better */
 			verbose("Read error: %v", err)
+			dc <- 0
 			return
 		}
 		/* Handle pings */
@@ -287,9 +295,8 @@ func reader(r *textproto.Reader, w *textproto.Writer, wg *sync.WaitGroup) {
 }
 
 /* Goroutine to handle outgoing messages */
-func sender(p *textproto.Reader, w *textproto.Writer, wg *sync.WaitGroup) {
+func sender(p *textproto.Reader, w *textproto.Writer, dc chan int) {
 	debug("Started sender")
-	defer wg.Done()
 	for {
 		/* Get a line to send, either from the buffer or the pipe */
 		if nil != gc.txbuf {
@@ -300,18 +307,22 @@ func sender(p *textproto.Reader, w *textproto.Writer, wg *sync.WaitGroup) {
 				/* TODO: Work out if we really need to exit */
 				log.Printf("Error getting line to send: %v",
 					err)
-				os.Exit(-4)
+				dc <- -1
+				return
 			}
 			/* Remove needless whitespace */
 			line = strings.TrimRightFunc(line, unicode.IsSpace)
 			gc.txbuf = &line
 			debug("Will send line: %v", *gc.txbuf)
 		}
+		/* Send the line */
 		if err := w.PrintfLine("PRIVMSG %v :%s", *gc.channel,
 			*gc.txbuf); err != nil {
 			verbose("Unable to send line: %v", err)
+			dc <- 0
 			return
 		} else {
+			/* If it worked, empty the buf for next time */
 			gc.txbuf = nil
 		}
 		time.Sleep(*gc.senddelay)
@@ -319,12 +330,12 @@ func sender(p *textproto.Reader, w *textproto.Writer, wg *sync.WaitGroup) {
 }
 
 /* Wait for a process to die */
-func waiter(c *exec.Cmd, wg *sync.WaitGroup) {
+func waiter(c *exec.Cmd, dc chan int) {
 	debug("Started waiter")
-	defer wg.Done()
 	if err := c.Wait(); err != nil {
 		log.Printf("openssl exited badly: %v", err)
 	}
+	dc <- 0
 }
 
 /* Verbose and debug output */
