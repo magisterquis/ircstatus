@@ -165,7 +165,6 @@ func mymain() int {
 		}
 		debug("Auth password: %v", *gc.idpass)
 	}
-	/* TODO: defer remove of created pipe, don't use os.Exit() */
 
 	/* Open the pipe */
 	pname := "" /* Pipe name */
