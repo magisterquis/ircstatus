@@ -238,18 +238,19 @@ func mymain() int {
 					return -6
 				}
 				b := make([]byte, 2048) /* Read buffer */
-				n := 1                  /* Bytes read */
 				/* Read from the pipe until it is empty */
-				for n > 0 {
+				for {
 					var e error
 					/* TODO: select here with timeout */
-					if n, e = pn.Read(b); e != nil &&
-						e != io.EOF {
+					n, e := pn.Read(b)
+					if e == io.EOF {
+						break
+					} else if e != nil && e != io.EOF {
 						log.Printf("Error flushing "+
 							"%v: %v", pname, e)
 						return -7
 					}
-					debug("Read %v bytes", n)
+					debug("Read %v bytes flushing pipe", n)
 				}
 				debug("Waiting on pipe-filler to exit")
 				cmd.Wait()
