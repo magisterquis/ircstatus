@@ -1,4 +1,4 @@
-  Handle nick changes
++ Handle nick changes
   Print RX lines on request
   Work out how to remove made fifos when os.Exit is called
     Catch SIGINT
