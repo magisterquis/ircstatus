@@ -69,6 +69,7 @@ var gc struct {
 	senddelay *time.Duration /* Time between sent lines */
 	verbose   *bool          /* Verbose output */
 	debug     *bool          /* Debug output */
+	rxproto   *bool          /* Print received received IRC messages */
 	savehelp  *string        /* Filename to which to save help text */
 
 	/* Global variables */
@@ -137,6 +138,8 @@ func mymain() int {
 		"output.  Implies -verbose.")
 	gc.savehelp = flag.String("savehelp", "", "Does nothing but write "+
 		"this help text to a file.")
+	gc.rxproto = flag.Bool("rxproto", false, "Log received IRC protocol "+
+		"messages.")
 	flag.Parse()
 
 	/* Only save the help */
@@ -349,6 +352,10 @@ func reader(r *textproto.Reader, w *textproto.Writer, dc chan int) {
 			verbose("Read error: %v", err)
 			dc <- 0
 			return
+		}
+		/* Print if desired */
+		if *gc.rxproto {
+			log.Printf("IRC: %v", l)
 		}
 		/* Handle incoming messages */
 		switch {

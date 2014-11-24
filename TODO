@@ -1,5 +1,5 @@
 + Handle nick changes
-  Print RX lines on request
++ Print RX lines on request
   Work out how to remove made fifos when os.Exit is called
     Catch SIGINT
 + Flush pipe before we start (in case of old writes from cronjobs)
