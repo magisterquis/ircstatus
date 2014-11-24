@@ -3,7 +3,7 @@
  * Program to make a host's staus visible to an IRC channel
  * by J. Stuart McMurray
  * Created 20141112
- * Last modified 20141121
+ * Last modified 20141124
  * Copyright (c) 2014 J. Stuart McMurray
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
