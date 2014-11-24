@@ -101,7 +101,10 @@ func mymain() int {
 	gc.port = flag.Uint("port", 7000, "IRC server port.")
 	gc.ssl = flag.Bool("ssl", true, "Use ssl.")
 	gc.nick = flag.String("nick", *gc.nick, "IRC nickname.")
-	gc.nums = flag.Bool("nums", true, "Append random numbers to the nick.  Even if this is not given, numbers may still be added in case of a nick conflict (which can happen in some cases if -wait is too short).")
+	gc.nums = flag.Bool("nums", true, "Append random numbers to the "+
+		"nick.  Even if this is not given, numbers may still be "+
+		"added in case of a nick conflict (which can happen in some "+
+		"cases if -wait is too short).")
 	gc.uname = flag.String("uname", "ircstatus", "Username.")
 	gc.rname = flag.String("rname", "Status over IRC", "Real name.")
 	gc.idnick = flag.String("idnick", "", "Nick to use to auth to "+
@@ -145,7 +148,8 @@ func mymain() int {
 	rand.Seed(time.Now().Unix())
 
 	/* Compile regular expressions */
-	gc.reNickInUse = regexp.MustCompile(`:\S+ 433 .* \S+ :Nickname is already in use`)
+	gc.reNickInUse = regexp.MustCompile(
+		`:\S+ 433 .* \S+ :Nickname is already in use`)
 
 	/* Local hostname */
 	debug("Local hostname: %v", *gc.nick)
