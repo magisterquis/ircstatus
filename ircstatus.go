@@ -31,6 +31,7 @@ import (
 	"container/list"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -63,10 +64,12 @@ var gc struct {
 	channel   *string        /* Channel to join */
 	chanpass  *string        /* Channel password */
 	pipe      *string        /* FIFO for reading */
+	flush     *bool          /* Flush pipe before reading */
 	wait      *time.Duration /* Time to wait between reconnects */
 	senddelay *time.Duration /* Time between sent lines */
 	verbose   *bool          /* Verbose output */
 	debug     *bool          /* Debug output */
+	savehelp  *string        /* Filename to which to save help text */
 
 	/* Global variables */
 	addr  string            /* Joined host:port */
@@ -94,24 +97,24 @@ func mymain() int {
 
 	/* Get options */
 	gc.host = flag.String("host", "chat.freenode.net", "IRC server "+
-		"hostname")
-	gc.port = flag.Uint("port", 7000, "IRC server port")
-	gc.ssl = flag.Bool("ssl", true, "Use ssl")
-	gc.nick = flag.String("nick", *gc.nick, "IRC nickname")
+		"hostname.")
+	gc.port = flag.Uint("port", 7000, "IRC server port.")
+	gc.ssl = flag.Bool("ssl", true, "Use ssl.")
+	gc.nick = flag.String("nick", *gc.nick, "IRC nickname.")
 	gc.nums = flag.Bool("nums", true, "Append random numbers to the nick.  Even if this is not given, numbers may still be added in case of a nick conflict (which can happen in some cases if -wait is too short).")
-	gc.uname = flag.String("uname", "ircstatus", "Username")
-	gc.rname = flag.String("rname", "Status over IRC", "Real name")
+	gc.uname = flag.String("uname", "ircstatus", "Username.")
+	gc.rname = flag.String("rname", "Status over IRC", "Real name.")
 	gc.idnick = flag.String("idnick", "", "Nick to use to auth to "+
 		"services.  If this is not specified but idpass is, the nick "+
 		"given by -nick or the nick derived from the hostname will "+
-		"be used")
+		"be used.")
 	gc.idpass = flag.String("idpass", "", "Pass to use to auth to "+
 		"services.  If this is not specified and but idnick is, the "+
-		"password will be read from the standard input")
+		"password will be read from the standard input.")
 	gc.channel = flag.String("channel", "##ircstatushub", "Channel to "+
-		"join")
+		"join.")
 	gc.chanpass = flag.String("chanpass", "hunter2", "Channel "+
-		"password (key)")
+		"password (key).")
 	gc.pipe = flag.String("pipe", "-", "Pipe from which to read.  This "+
 		"can be \"-\" to indicate stdin, \"nick\" to cause a pipe "+
 		"(i.e. fifo) to be created in "+os.TempDir()+" with the "+
@@ -119,15 +122,24 @@ func mymain() int {
 		"where one will be created if none exists.  Only text data "+
 		"should be sent on this pipe.  Data will be buffered until "+
 		"a newline (or \\r\\n) is read.  Lines should not be longer "+
-		"than IRC allows (a bit under 510 bytes)")
+		"than IRC allows (a bit under 510 bytes).")
+	gc.flush = flag.Bool("flush", true, "Discard all data on the pipe "+
+		"that existed before starting.  Ignored for -pipe=-.")
 	gc.wait = flag.Duration("wait", time.Duration(10)*time.Second,
-		"Time to wait between reconnection attempts")
+		"Time to wait between reconnection attempts.")
 	gc.senddelay = flag.Duration("senddelay", time.Second, "Time to "+
 		"delay between lines sent to avoid flooding.")
-	gc.verbose = flag.Bool("verbose", false, "Print some non-error output")
+	gc.verbose = flag.Bool("verbose", false, "Print some non-error output.")
 	gc.debug = flag.Bool("debug", false, "Print more non-error "+
-		"output.  Implies -verbose")
+		"output.  Implies -verbose.")
+	gc.savehelp = flag.String("savehelp", "", "Does nothing but write "+
+		"this help text to a file.")
 	flag.Parse()
+
+	/* Only save the help */
+	if "" != *gc.savehelp {
+		return saveHelp(*gc.savehelp)
+	}
 
 	/* Seed the random number generator */
 	rand.Seed(time.Now().Unix())
@@ -192,7 +204,8 @@ func mymain() int {
 		fi, err := os.Stat(pname)
 		/* Nothing there */
 		if os.IsNotExist(err) {
-			debug("Pipe does not already exist, creating pipe")
+			debug("Pipe %v does not already exist, creating pipe",
+				pname)
 			if err := syscall.Mkfifo(pname, 0644); err != nil {
 				log.Printf("Unable to make %v: %v", pname, err)
 				return -3
@@ -205,7 +218,43 @@ func mymain() int {
 		/* Have a named pipe already */
 		if err == nil && (fi.Mode()&os.ModeNamedPipe != 0) {
 			debug("Pipe %v (now) exists", pname)
-			/* Try to open the file */
+			/* Flush the pipe, if required */
+			if *gc.flush {
+				/* Put data on the pipe in case it's empty */
+				cmd := forkSaveHelp(pname)
+				/* Open pipe to flush it */
+				debug("Opening %v for flushing", pname)
+				pn, err := os.Open(pname)
+				if err != nil {
+					log.Printf("Unable to open %v for "+
+						"flushing: %v", pname, err)
+					return -6
+				}
+				b := make([]byte, 2048) /* Read buffer */
+				n := 1                  /* Bytes read */
+				/* Read from the pipe until it is empty */
+				for n > 0 {
+					var e error
+					/* TODO: select here with timeout */
+					if n, e = pn.Read(b); e != nil &&
+						e != io.EOF {
+						log.Printf("Error flushing "+
+							"%v: %v", pname, e)
+						return -7
+					}
+					debug("Read %v bytes", n)
+				}
+				debug("Waiting on pipe-filler to exit")
+				cmd.Wait()
+				/* Close the pipe */
+				if err := pn.Close(); err != nil {
+					log.Printf("Error closing %v: %v",
+						pname, err)
+					return -8
+				}
+
+			}
+			/* Try to open the pipe RW, to prevent EOFs */
 			f, e := os.OpenFile(pname, os.O_RDWR, 0600)
 			if e != nil {
 				log.Printf("Unable to open pipe named %v: %v",
@@ -266,7 +315,7 @@ func mymain() int {
 		/* Channel to communicate death */
 		dc := make(chan int) /* 0 for ok, -1 for die */
 
-		go reader(r, w, dc) /* DEBUG */
+		go reader(r, w, dc)
 		go sender(gc.ipipe, w, dc)
 		go waiter(cmd, dc)
 
@@ -398,6 +447,37 @@ func setNick(n bool, w *textproto.Writer) bool {
 		return false
 	}
 	return true
+}
+
+/* saveHelp writes the help text to a file */
+func saveHelp(fname string) int {
+	/* Open output file */
+	f, err := os.Create(fname)
+	if err != nil {
+		fmt.Printf("Unable to open %v to write help text: %v\n", fname,
+			err)
+		return -9
+	}
+	debug("Opened %v for saving help", fname)
+	flag.CommandLine.SetOutput(f)
+	debug("Set output to %v", f)
+	flag.PrintDefaults()
+	debug("Saved help text to %v", fname)
+	return 0
+}
+
+/* forkSaveHelp writes the help data to the specified file. */
+func forkSaveHelp(fname string) *exec.Cmd {
+	/* Make a command out of ourselves */
+	c := exec.Command(os.Args[0], "-savehelp", fname)
+	/* Run the command */
+	debug("Running %v to have data to flush from %v", c.Args, fname)
+	err := c.Start()
+	if err != nil {
+		fmt.Printf("Error putting data into %v for flushing: %v",
+			fname, err)
+	}
+	return c
 }
 
 /* Verbose and debug output */
