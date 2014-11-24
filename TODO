@@ -8,3 +8,4 @@
   Watch for confirmation of ALL the commands
     Condition variable in recevier
   Don't send messages until 353 received
+  Part message on exit
