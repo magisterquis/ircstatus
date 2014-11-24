@@ -1,6 +1,6 @@
   Handle nick changes
   Print RX lines on request
   Work out how to remove made fifos when os.Exit is called
-    A goroutine that does the starting of openssl, all goroutines can signal
-        main to exit.
+    Catch SIGINT
+  Flush pipe before we start (in case of old writes from cronjobs)
 + Auth to services
