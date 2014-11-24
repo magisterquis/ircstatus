@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -73,6 +74,10 @@ var gc struct {
 	user  string            /* Data passed to USER */
 	txbuf *string           /* String we're trying to send */
 	ipipe *textproto.Reader /* Pipe from which to read */
+	onick string            /* Original nick, pre-numbers */
+
+	/* Regular Expressions */
+	reNickInUse *regexp.Regexp /* Nick in use */
 }
 
 func main() { os.Exit(mymain()) }
@@ -93,7 +98,7 @@ func mymain() int {
 	gc.port = flag.Uint("port", 7000, "IRC server port")
 	gc.ssl = flag.Bool("ssl", true, "Use ssl")
 	gc.nick = flag.String("nick", *gc.nick, "IRC nickname")
-	gc.nums = flag.Bool("nums", true, "Append random numbers to the nick")
+	gc.nums = flag.Bool("nums", true, "Append random numbers to the nick.  Even if this is not given, numbers may still be added in case of a nick conflict (which can happen in some cases if -wait is too short).")
 	gc.uname = flag.String("uname", "ircstatus", "Username")
 	gc.rname = flag.String("rname", "Status over IRC", "Real name")
 	gc.idnick = flag.String("idnick", "", "Nick to use to auth to "+
@@ -124,15 +129,17 @@ func mymain() int {
 		"output.  Implies -verbose")
 	flag.Parse()
 
+	/* Seed the random number generator */
+	rand.Seed(time.Now().Unix())
+
+	/* Compile regular expressions */
+	gc.reNickInUse = regexp.MustCompile(`:\S+ 433 .* \S+ :Nickname is already in use`)
+
 	/* Local hostname */
 	debug("Local hostname: %v", *gc.nick)
 
-	/* Work out our nick */
-	if *gc.nums {
-		rand.Seed(time.Now().Unix())
-		*gc.nick = fmt.Sprintf("%v-%v", *gc.nick, rand.Int63())
-	}
-	verbose("Initial nick: %v", *gc.nick)
+	/* Save original nick */
+	gc.onick = *gc.nick
 
 	/* Work out the user */
 	gc.user = fmt.Sprintf("%v x x :%v", *gc.uname, *gc.rname)
@@ -248,33 +255,7 @@ func mymain() int {
 		}
 
 		/* Set nick and user */
-		n := fmt.Sprintf("NICK %v\n", *gc.nick)
-		debug("Setting nick: %v", n)
-		if err := w.PrintfLine(n); err != nil {
-			log.Printf("Error setting nick: %v", err)
-			sleep()
-			continue
-		}
-		u := fmt.Sprintf("USER %v", gc.user)
-		debug("Setting user: %v", u)
-		if err := w.PrintfLine(u); err != nil {
-			log.Printf("Error setting user: %v", err)
-			sleep()
-			continue
-		}
-
-		/* Auth to services */
-		if "" != *gc.idnick && "" != *gc.idpass {
-			verbose("Authenticating to services")
-			w.PrintfLine("PRIVMSG nickserv :identify %v %v",
-				*gc.idnick, *gc.idpass)
-		}
-		/* Join Channel */
-		c := fmt.Sprintf("JOIN %v %v", *gc.channel, *gc.chanpass)
-		debug("Joining channel: %v", c)
-		if err := w.PrintfLine(c); err != nil {
-			log.Printf("Error requesting to join channel %v: %v",
-				err)
+		if !setNick(false, w) {
 			sleep()
 			continue
 		}
@@ -316,9 +297,17 @@ func reader(r *textproto.Reader, w *textproto.Writer, dc chan int) {
 			dc <- 0
 			return
 		}
-		/* Handle pings */
-		if strings.HasPrefix(strings.ToLower(l), "ping ") {
+		/* Handle incoming messages */
+		switch {
+		case strings.HasPrefix(strings.ToLower(l), "ping "):
+			/* Pings */
 			w.PrintfLine("PONG ", l[5:])
+		case gc.reNickInUse.MatchString(l):
+			verbose("Nick %v in use, trying a new one", *gc.nick)
+			if !setNick(true, w) {
+				dc <- 0
+				return
+			}
 		}
 	}
 }
@@ -365,6 +354,50 @@ func waiter(c *exec.Cmd, dc chan int) {
 		log.Printf("openssl exited badly: %v", err)
 	}
 	dc <- 0
+}
+
+/* makeNick makes a new nick with numbers.  n overrides *gc.nums */
+func setNick(n bool, w *textproto.Writer) bool {
+	/* Add numbers if needed */
+	if *gc.nums || n {
+		*gc.nick = fmt.Sprintf("%v-%v", gc.onick, rand.Int63())
+	}
+
+	/* Tell the user what the nick is */
+	nick := fmt.Sprintf("NICK %v\n", *gc.nick)
+	verbose("Setting nick: %v", *gc.nick)
+	/* Set the nick */
+	if err := w.PrintfLine(nick); err != nil {
+		log.Printf("Error setting nick: %v", err)
+		return false
+	}
+
+	/* Set the user */
+	u := fmt.Sprintf("USER %v", gc.user)
+	debug("Setting user: %v", u)
+	if err := w.PrintfLine(u); err != nil {
+		log.Printf("Error setting user: %v", err)
+		return false
+	}
+
+	/* Auth to services */
+	if "" != *gc.idnick && "" != *gc.idpass {
+		verbose("Authenticating to services")
+		if err := w.PrintfLine("PRIVMSG nickserv :identify %v %v",
+			*gc.idnick, *gc.idpass); err != nil {
+			log.Printf("Error authenticating to services: %v")
+			return false
+		}
+	}
+
+	/* Join Channel */
+	c := fmt.Sprintf("JOIN %v %v", *gc.channel, *gc.chanpass)
+	debug("Joining channel: %v", c)
+	if err := w.PrintfLine(c); err != nil {
+		log.Printf("Error requesting to join channel %v: %v", err)
+		return false
+	}
+	return true
 }
 
 /* Verbose and debug output */
