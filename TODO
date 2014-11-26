@@ -4,9 +4,9 @@
     Catch SIGINT
 + Flush pipe before we start (in case of old writes from cronjobs)
 + Auth to services
-  Watch for confirmation of join, retry if not gotten
++ Watch for confirmation of join, retry if not gotten
   Watch for confirmation of ALL the commands
     Condition variable in recevier
-  Don't send messages until 353 received
++ Don't send messages until 353 received
   Part message on exit
   Print own nick as understood by server

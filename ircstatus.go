@@ -3,7 +3,8 @@
  * Program to make a host's staus visible to an IRC channel
  * by J. Stuart McMurray
  * Created 20141112
- * Last modified 20141124
+ * Last modified 20141126
+ *
  * Copyright (c) 2014 J. Stuart McMurray
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -31,6 +32,7 @@ import (
 	"container/list"
 	"flag"
 	"fmt"
+	"github.com/kd5pbo/killroutines"
 	"io"
 	"log"
 	"math/rand"
@@ -79,12 +81,20 @@ var gc struct {
 	txbuf *string           /* String we're trying to send */
 	ipipe *textproto.Reader /* Pipe from which to read */
 	onick string            /* Original nick, pre-numbers */
+	rbuf  chan string       /* Global read (from pipe) buffer */
 
 	/* Regular Expressions */
-	reNickInUse *regexp.Regexp /* Nick in use */
+	reNickInUse     *regexp.Regexp /* Nick in use */
+	reChannelJoined *regexp.Regexp /* Channel joined */
 }
 
-func main() { os.Exit(mymain()) }
+/* Regular Expression Literals */
+var reNickInUse string = `(:\S+ )?433 .* \S+ :Nickname is already in use\.?`
+var reChannelJoined string = `(:\S+ )?353 `
+
+func main() { /* Signal handlers */
+	os.Exit(mymain())
+}
 func mymain() int {
 	/* Get local hostname for flag default */
 	n, err := os.Hostname()
@@ -151,8 +161,8 @@ func mymain() int {
 	rand.Seed(time.Now().Unix())
 
 	/* Compile regular expressions */
-	gc.reNickInUse = regexp.MustCompile(
-		`:\S+ 433 .* \S+ :Nickname is already in use`)
+	gc.reNickInUse = regexp.MustCompile(reNickInUse)
+	gc.reChannelJoined = regexp.MustCompile(reChannelJoined)
 
 	/* Local hostname */
 	debug("Local hostname: %v", *gc.nick)
@@ -277,6 +287,12 @@ func mymain() int {
 		return -2
 	}
 
+	/* Make the pipe read buffer */
+	gc.rbuf = make(chan string, 1)
+	/* Start the pipe reader */
+	go readPipe(gc.ipipe, gc.rbuf)
+
+	/* TODO: Make it compile, and pass variables to reader and writer to synchronize */
 	/* Main program loop */
 	for {
 		/* Command to use to connect to server */
@@ -311,21 +327,28 @@ func mymain() int {
 			continue
 		}
 
+		/* Channel to communicate death from goroutines */
+		dc := make(chan int) /* 0 for ok, -1 for die */
+
+		/* Synchronize death */
+		done := killroutines.New()
+
+		/* Channel to signal writes to channel can start */
+		ready := make(chan string)
+
+		/* TODO: Have goroutines check if done is closed before
+		whining */
+
+		/* TODO: Pass a channel that signifies all are done */
+		go reader(r, w, dc, done, ready)
+		go sender(w, dc, done, ready)
+		go waiter(cmd, dc, done)
+
 		/* Set nick and user */
 		if !setNick(false, w) {
 			sleep()
 			continue
 		}
-
-		/* Tell interested users we've sent initial messages */
-		verbose("Set nick and user and sent request to join channel")
-
-		/* Channel to communicate death */
-		dc := make(chan int) /* 0 for ok, -1 for die */
-
-		go reader(r, w, dc)
-		go sender(gc.ipipe, w, dc)
-		go waiter(cmd, dc)
 
 		/* Wait for goroutines to end */
 		for i := 0; i < 3; i++ {
@@ -341,80 +364,190 @@ func mymain() int {
 }
 
 /* Goroutine to handle incoming messages */
-func reader(r *textproto.Reader, w *textproto.Writer, dc chan int) {
+func reader(r *textproto.Reader, w *textproto.Writer, dc chan int,
+	done *killroutines.K, ready chan string) {
 	debug("Starting reader")
+
+	/* Channel to read from network */
+	c := make(chan string)
+	/* Read from the network into the channel */
+	go func() {
+		for {
+			/* Get a line */
+			l, err := r.ReadLine()
+			/* If there's a problem, signal a reconnect */
+			if err != nil {
+				log.Printf("Error reading from network")
+				close(c)
+				return
+			}
+			/* Print if desired */
+			if *gc.rxproto {
+				log.Printf("IRC-> %v", l)
+			}
+			/* Put the line on the channel */
+			c <- l
+		}
+	}()
+
 	/* Read lines until an error */
 	for {
-		/* Get a line */
-		l, err := r.ReadLine()
-		/* Handle errors */
-		if err != nil {
-			/* TODO: Make this better */
-			verbose("Read error: %v", err)
+		l := "" /* Received line */
+		/* Get a line or be done */
+		select {
+		case <-done.Chan(): /* Time to die */
 			dc <- 0
 			return
-		}
-		/* Print if desired */
-		if *gc.rxproto {
-			log.Printf("IRC: %v", l)
-		}
-		/* Handle incoming messages */
-		switch {
-		case strings.HasPrefix(strings.ToLower(l), "ping "):
-			/* Pings */
-			w.PrintfLine("PONG ", l[5:])
-		case gc.reNickInUse.MatchString(l):
-			verbose("Nick %v in use, trying a new one", *gc.nick)
-			if !setNick(true, w) {
+		case line, ok := <-c:
+			/* Handle errors */
+			if !ok {
+				/* If we have a read error, new connection */
+				done.Signal()
 				dc <- 0
 				return
 			}
+			l = line
+		}
+		/* Handle incoming messages */
+		switch {
+		case strings.HasPrefix(strings.ToLower(l), "ping "): /* Ping */
+			w.PrintfLine("PONG ", l[5:])
+		case gc.reNickInUse.MatchString(l): /* Nick is in use */
+			verbose("Nick %v in use, trying a new one", *gc.nick)
+			/* Set a new nick */
+			if !setNick(true, w) {
+				done.Signal()
+				dc <- 0
+				return
+			}
+		case gc.reChannelJoined.MatchString(l): /* Channel's joined */
+			verbose("Joined %v", *gc.channel)
+			close(ready)
 		}
 	}
 }
 
-/* Goroutine to handle outgoing messages */
-func sender(p *textproto.Reader, w *textproto.Writer, dc chan int) {
+/* Goroutine to handle outgoing messages.  cv is a condition variable that
+wakes us up when sending is ready (after a channel join and so on, cs tells
+us it's ok to send (can send). */
+func sender(w *textproto.Writer, dc chan int, done *killroutines.K,
+	ready chan string) {
 	debug("Started sender")
-	for {
-		/* Get a line to send, either from the buffer or the pipe */
-		if nil != gc.txbuf {
-			debug("Will send buffered line: %v", *gc.txbuf)
-		} else {
-			line, err := p.ReadLine()
-			if err != nil {
-				/* TODO: Work out if we really need to exit */
-				log.Printf("Error getting line to send: %v",
-					err)
-				dc <- 0
-				return
-			}
-			/* Remove needless whitespace */
-			line = strings.TrimRightFunc(line, unicode.IsSpace)
-			gc.txbuf = &line
-			debug("Will send line: %v", *gc.txbuf)
-		}
+	defer debug("No longer sending")
+	/* Closure to send a line.  Returns true if we should return */
+	send := func(l string) {
+		/* Put the line in the buffer */
+		gc.txbuf = &l
 		/* Send the line */
 		if err := w.PrintfLine("PRIVMSG %v :%s", *gc.channel,
+			/* If it failed, start the reconnect process */
 			*gc.txbuf); err != nil {
 			verbose("Unable to send line: %v", err)
+			done.Signal()
 			dc <- 0
 			return
 		} else {
 			/* If it worked, empty the buf for next time */
 			gc.txbuf = nil
 		}
-		time.Sleep(*gc.senddelay)
+	}
+	/* TODO: Add a mutex to the cond */
+	/* TODO: Wait for the cond to fire or <-done */
+	/* Wait for writing to be allowable or the signal to return */
+	select {
+	case <-done.Chan(): /* Time to exit */
+		debug("Sender dying before it started")
+		dc <- 0
+		return
+	case <-ready: /* In channel, ready to send */
+		debug("Sender can send")
+	}
+
+	/* First try to send the txbuf now that we can send */
+	if nil != gc.txbuf {
+		debug("Sending TX buffer: %v", *gc.txbuf)
+		send(*gc.txbuf)
+	}
+
+	/* Set up reads from r */
+	for {
+		/* TODO: Wait for something on p or done */
+		select {
+		case line, ok := <-gc.rbuf: /* Received a line */
+			if !ok { /* Error */
+				done.Signal()
+				dc <- -1
+				return
+			}
+			/* Remove needless whitespace */
+			line = strings.TrimRightFunc(line, unicode.IsSpace)
+			gc.txbuf = &line
+			debug("Will send line: %v", *gc.txbuf)
+			/* Send the line */
+			/* TODO: Use closure */
+			if err := w.PrintfLine("PRIVMSG %v :%s", *gc.channel,
+				*gc.txbuf); err != nil {
+				verbose("Unable to send line: %v", err)
+				done.Signal()
+				dc <- 0
+				return
+			}
+			/* If it worked, empty the buf for next time */
+			gc.txbuf = nil
+			time.Sleep(*gc.senddelay)
+		case <-done.Chan(): /* We're meant to stop */
+			dc <- 0
+			return
+		}
+	}
+}
+
+/* readPipe reads lines from r and sends them to c */
+func readPipe(r *textproto.Reader, c chan string) {
+	debug("Reading from a pipe into a channel")
+	defer debug("No longer reading from the pipe.")
+	/* Wait for a line or c to close */
+	for {
+		l, err := r.ReadLine()
+		/* Close c to signal an error */
+		if err != nil {
+			/* TODO: Work out if we really need to exit */
+			log.Printf("Error getting line to send: %v",
+				err)
+			close(c)
+			return
+		}
+		/* Send the read line out */
+		c <- l
 	}
 }
 
 /* Wait for a process to die */
-func waiter(c *exec.Cmd, dc chan int) {
+func waiter(c *exec.Cmd, dc chan int, done *killroutines.K) {
 	debug("Started waiter")
-	if err := c.Wait(); err != nil {
-		log.Printf("openssl exited badly: %v", err)
+	defer debug("Waited")
+	wc := make(chan int)
+	go func() {
+		if err := c.Wait(); err != nil {
+			log.Printf("openssl exited badly: %v", err)
+		}
+		close(wc)
+	}()
+	/* Wait for openssl to die */
+	select {
+	case <-wc: /* OpenSSL died */
+		/* Tell the other goroutines to die */
+		done.Signal()
+	case <-done.Chan(): /* We should die */
+		/* Stop OpenSSL */
+		debug("Killing OpenSSL (pid %v)", c.Process.Pid)
+		if err := c.Process.Kill(); err != nil {
+			log.Printf("Unable to kill OpenSSL (pid %v): %v",
+				c.Process.Pid, err)
+		}
 	}
 	dc <- 0
+	return
 }
 
 /* makeNick makes a new nick with numbers.  n overrides *gc.nums */
