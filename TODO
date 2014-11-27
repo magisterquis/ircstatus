@@ -9,5 +9,5 @@
     Condition variable in recevier
 + Don't send messages until 353 received
   Part message on exit
-  Print own nick as understood by server
++ Print own nick as understood by server
 + Debug pings

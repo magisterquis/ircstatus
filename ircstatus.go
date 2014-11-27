@@ -82,15 +82,21 @@ var gc struct {
 	ipipe *textproto.Reader /* Pipe from which to read */
 	onick string            /* Original nick, pre-numbers */
 	rbuf  chan string       /* Global read (from pipe) buffer */
+	snick string            /* Nick as understood by the server */
 
 	/* Regular Expressions */
 	reNickInUse     *regexp.Regexp /* Nick in use */
 	reChannelJoined *regexp.Regexp /* Channel joined */
+	reNoNickGiven   *regexp.Regexp /* No Nick given */
 }
 
 /* Regular Expression Literals */
+/* TODO: Fix rNIU re to remove space */
 var reNickInUse string = `(:\S+ )?433 .* \S+ :Nickname is already in use\.?`
+
+/* TODO: Fix rCJ */
 var reChannelJoined string = `(:\S+ )?353 `
+var reNoNickGiven string = `(?:\S+ )?431 (\S+) .*:No nickname given\.?`
 
 func main() { /* Signal handlers */
 	os.Exit(mymain())
@@ -163,6 +169,7 @@ func mymain() int {
 	/* Compile regular expressions */
 	gc.reNickInUse = regexp.MustCompile(reNickInUse)
 	gc.reChannelJoined = regexp.MustCompile(reChannelJoined)
+	gc.reNoNickGiven = regexp.MustCompile(reNoNickGiven)
 
 	/* Local hostname */
 	debug("Local hostname: %v", *gc.nick)
@@ -425,6 +432,17 @@ func reader(r *textproto.Reader, w *textproto.Writer, dc chan int,
 		case gc.reChannelJoined.MatchString(l): /* Channel's joined */
 			verbose("Joined %v", *gc.channel)
 			close(ready)
+		case gc.reNoNickGiven.MatchString(l): /* No Nick was given */
+			/* Extract the nick */
+			m := gc.reNoNickGiven.FindStringSubmatch(l)
+			/* Make sure we have it */
+			if 2 != len(m) {
+				verbose("Error processing \"No nickname " +
+					"given\" message")
+			}
+			/* Save the nick given by the server */
+			gc.snick = m[1]
+			verbose("Nick is %v", gc.snick)
 		}
 	}
 }
@@ -591,6 +609,14 @@ func setNick(n bool, w *textproto.Writer) bool {
 	debug("Joining channel: %v", c)
 	if err := w.PrintfLine(c); err != nil {
 		log.Printf("Error requesting to join channel %v: %v", err)
+		return false
+	}
+
+	/* Send an erroneous nick command, to get our own for sure */
+	debug("Requesting nick with erroneous NICK command")
+	if err := w.PrintfLine("NICK"); err != nil {
+		log.Printf("Unable to send intentionally erroneous NICK "+
+			"command: err", err)
 		return false
 	}
 	return true
