@@ -3,7 +3,7 @@
  * Program to make a host's staus visible to an IRC channel
  * by J. Stuart McMurray
  * Created 20141112
- * Last modified 20141126
+ * Last modified 20141127
  *
  * Copyright (c) 2014 J. Stuart McMurray
  *
@@ -411,7 +411,9 @@ func reader(r *textproto.Reader, w *textproto.Writer, dc chan int,
 		/* Handle incoming messages */
 		switch {
 		case strings.HasPrefix(strings.ToLower(l), "ping "): /* Ping */
-			w.PrintfLine("PONG ", l[5:])
+			reply := fmt.Sprintf("PONG ", l[5:])
+			w.PrintfLine(reply)
+			debug("Sent ping reply: %v", reply)
 		case gc.reNickInUse.MatchString(l): /* Nick is in use */
 			verbose("Nick %v in use, trying a new one", *gc.nick)
 			/* Set a new nick */
