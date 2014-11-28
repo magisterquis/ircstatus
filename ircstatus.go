@@ -91,8 +91,7 @@ var gc struct {
 }
 
 /* Regular Expression Literals */
-/* TODO: Fix rNIU re to remove space */
-var reNickInUse string = `(:\S+ )?433 .* \S+ :Nickname is already in use\.?`
+var reNickInUse string = `(:\S+ )?433 .*\S+ :Nickname is already in use\.?`
 
 /* TODO: Fix rCJ */
 var reChannelJoined string = `(:\S+ )?353 `
@@ -299,7 +298,6 @@ func mymain() int {
 	/* Start the pipe reader */
 	go readPipe(gc.ipipe, gc.rbuf)
 
-	/* TODO: Make it compile, and pass variables to reader and writer to synchronize */
 	/* Main program loop */
 	for {
 		/* Command to use to connect to server */
@@ -343,10 +341,7 @@ func mymain() int {
 		/* Channel to signal writes to channel can start */
 		ready := make(chan string)
 
-		/* TODO: Have goroutines check if done is closed before
-		whining */
-
-		/* TODO: Pass a channel that signifies all are done */
+		/* Start goroutines going */
 		go reader(r, w, dc, done, ready)
 		go sender(w, dc, done, ready)
 		go waiter(cmd, dc, done)
@@ -471,8 +466,6 @@ func sender(w *textproto.Writer, dc chan int, done *killroutines.K,
 			gc.txbuf = nil
 		}
 	}
-	/* TODO: Add a mutex to the cond */
-	/* TODO: Wait for the cond to fire or <-done */
 	/* Wait for writing to be allowable or the signal to return */
 	select {
 	case <-done.Chan(): /* Time to exit */
@@ -491,7 +484,6 @@ func sender(w *textproto.Writer, dc chan int, done *killroutines.K,
 
 	/* Set up reads from r */
 	for {
-		/* TODO: Wait for something on p or done */
 		select {
 		case line, ok := <-gc.rbuf: /* Received a line */
 			if !ok { /* Error */
@@ -504,7 +496,6 @@ func sender(w *textproto.Writer, dc chan int, done *killroutines.K,
 			gc.txbuf = &line
 			debug("Will send line: %v", *gc.txbuf)
 			/* Send the line */
-			/* TODO: Use closure */
 			if err := w.PrintfLine("PRIVMSG %v :%s", *gc.channel,
 				*gc.txbuf); err != nil {
 				verbose("Unable to send line: %v", err)
