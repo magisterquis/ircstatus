@@ -11,3 +11,5 @@
   Part message on exit
 + Print own nick as understood by server
 + Debug pings
+  Re-factor, do less asynchronously
+  Document that -debug has security implications
