@@ -13,3 +13,4 @@
 + Debug pings
   Re-factor, do less asynchronously
   Document that -debug has security implications
+  Set sub-second precision on -debug for log messages
