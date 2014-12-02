@@ -197,6 +197,10 @@ func mymain() int {
 	gc.txlines = flag.Bool("txlines", false, "Log lines sent to IRC "+
 		"server")
 	flag.Parse()
+	/* Set more precision if -debug */
+	if *gc.debug {
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	}
 	debug("Local hostname: %v", n)
 
 	/* Only save the help if requested */
