@@ -29,34 +29,30 @@ package main
 
 import (
 	"bufio"
-	"container/list"
+	"errors"
 	"flag"
 	"fmt"
-	"github.com/kd5pbo/killroutines"
+	"github.com/kd5pbo/minimalirc"
 	"io"
 	"log"
-	"math/rand"
-	"net"
-	"net/textproto"
+	"math"
 	"os"
-	"os/exec"
-	"path"
+	"os/signal"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
-	"unicode"
 )
 
 /* Defaults */
-var defaultnick string = "ircstatus"
+const defaultnick = "ircstatus"
 
 /* Global config */
 var gc struct {
 	/* Flags */
 	host      *string        /* IRC server hostname */
 	port      *uint          /* IRC server port */
-	ssl       *bool          /* Whether to use SSL */
+	ssl       *bool          /* Connect with SSL/TLS */
+	sslname   *string        /* Hostname on cert */
 	nick      *string        /* IRC nick to use */
 	nums      *bool          /* Append random numbers to nick */
 	uname     *string        /* Username to pass to IRC server */
@@ -65,40 +61,70 @@ var gc struct {
 	idpass    *string        /* Password to use to auth to Nickserv */
 	channel   *string        /* Channel to join */
 	chanpass  *string        /* Channel password */
+	qmsg      *string        /* IRC quit message */
 	pipe      *string        /* FIFO for reading */
 	flush     *bool          /* Flush pipe before reading */
+	rmpipe    *bool          /* Remove pipe after exit */
 	wait      *time.Duration /* Time to wait between reconnects */
 	senddelay *time.Duration /* Time between sent lines */
 	verbose   *bool          /* Verbose output */
 	debug     *bool          /* Debug output */
 	rxproto   *bool          /* Print received received IRC messages */
+	txlines   *bool          /* Print lines sent to IRC server */
 	savehelp  *string        /* Filename to which to save help text */
-
-	/* Global variables */
-	addr  string            /* Joined host:port */
-	wq    *list.List        /* Queue of messages to send */
-	user  string            /* Data passed to USER */
-	txbuf *string           /* String we're trying to send */
-	ipipe *textproto.Reader /* Pipe from which to read */
-	onick string            /* Original nick, pre-numbers */
-	rbuf  chan string       /* Global read (from pipe) buffer */
-	snick string            /* Nick as understood by the server */
-
-	/* Regular Expressions */
-	reNickInUse     *regexp.Regexp /* Nick in use */
-	reChannelJoined *regexp.Regexp /* Channel joined */
-	reNoNickGiven   *regexp.Regexp /* No Nick given */
 }
 
-/* Regular Expression Literals */
-var reNickInUse string = `(:\S+ )?433 .*\S+ :Nickname is already in use\.?`
+/* Global regular expressions */
+const reChannelJoined = `(:\S+ )?353 .*\S+ `
+const reNickInUse = `(:\S+ )?433 .*\S+ :Nickname is already in use\.?`
 
-/* TODO: Fix rCJ */
-var reChannelJoined string = `(:\S+ )?353 `
-var reNoNickGiven string = `(?:\S+ )?431 (\S+) .*:No nickname given\.?`
+var re struct {
+	ChannelJoined *regexp.Regexp
+	NickInUse     *regexp.Regexp
+}
+
+/* Global name of pipe to remove, if any */
+var rempname string = ""
+
+/* Global IRC struct */
+var irc *minimalirc.IRC = nil
 
 func main() { /* Signal handlers */
-	os.Exit(mymain())
+	ret := 0            /* Return value from main */
+	m := make(chan int) /* Channel on which to get return value */
+	go func() {
+		i := mymain()
+		m <- i
+	}()
+	/* Set up signal channel */
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, os.Interrupt)
+	select {
+	case ret = <-m:
+		break
+	case s := <-sigchan:
+		if os.Interrupt != s {
+			verbose("Caught unpossible signal")
+		}
+		ret = -5
+	}
+	/* Gracefully quit IRC */
+	if nil != irc {
+		debug("Gracefully QUITting IRC")
+		if err := irc.Quit(""); err != nil {
+			verbose("Error encountered gracefully quitting "+
+				"IRC: %v", err)
+		}
+	}
+	/* Remove the pipe */
+	if "" != rempname {
+		debug("Removing %v", rempname)
+		if err := os.Remove(rempname); nil != err {
+			verbose("Unable to remove pipe %v: %v", rempname, err)
+		}
+	}
+
+	os.Exit(ret)
 }
 func mymain() int {
 	/* Get local hostname for flag default */
@@ -107,20 +133,25 @@ func mymain() int {
 	if nil != err {
 		log.Printf("Unable to determine hostname: %v", err)
 		*gc.nick = defaultnick
+	} else {
+		/* Only want the bit before the first . */
+		*gc.nick = strings.SplitN(*gc.nick, ".", 2)[0]
 	}
-	/* Only want the bit before the first . */
-	*gc.nick = strings.SplitN(*gc.nick, ".", 2)[0]
 
 	/* Get options */
 	gc.host = flag.String("host", "chat.freenode.net", "IRC server "+
 		"hostname.")
 	gc.port = flag.Uint("port", 7000, "IRC server port.")
-	gc.ssl = flag.Bool("ssl", true, "Use ssl.")
+	gc.ssl = flag.Bool("ssl", true, "Use SSL/TLS.")
+	gc.sslname = flag.String("sslname", "", "Hostname expected on "+
+		"server's SSL certificate.  If this is not specified, and "+
+		"-ssl is, -host will be used.")
 	gc.nick = flag.String("nick", *gc.nick, "IRC nickname.")
 	gc.nums = flag.Bool("nums", true, "Append random numbers to the "+
 		"nick.  Even if this is not given, numbers may still be "+
 		"added in case of a nick conflict (which can happen in some "+
-		"cases if -wait is too short).")
+		"cases if -wait is too short).  The numbers will change "+
+		"every time a new connection is established.")
 	gc.uname = flag.String("uname", "ircstatus", "Username.")
 	gc.rname = flag.String("rname", "Status over IRC", "Real name.")
 	gc.idnick = flag.String("idnick", "", "Nick to use to auth to "+
@@ -134,18 +165,25 @@ func mymain() int {
 		"join.")
 	gc.chanpass = flag.String("chanpass", "hunter2", "Channel "+
 		"password (key).")
+	gc.qmsg = flag.String("qmsg", "https://github.com/kd5pbo/ircstatus",
+		"Message to send when closing connection to IRC server.")
 	gc.pipe = flag.String("pipe", "-", "Pipe from which to read.  This "+
 		"can be \"-\" to indicate stdin, \"nick\" to cause a pipe "+
 		"(i.e. fifo) to be created in "+os.TempDir()+" with the "+
 		"name of the initial nick, or a path (like /tmp/ircstatus) "+
 		"where one will be created if none exists.  Only text data "+
 		"should be sent on this pipe.  Data will be buffered until "+
-		"a newline (or \\r\\n) is read.  Lines should not be longer "+
-		"than IRC allows (a bit under 510 bytes).")
+		"a newline (or \\r\\n) is read.  Lines too long for one "+
+		"message will be split into smaller lines.  In some cases, "+
+		"with extremely long channel names, certain multi-byte "+
+		"unicode characters may be replaced with a '?'.  If "+
+		"-pipe=nick is given, the created pipe will be removed upon "+
+		"exit.")
 	gc.flush = flag.Bool("flush", true, "Discard all data on the pipe "+
 		"that existed before starting.  Ignored for -pipe=-.")
 	gc.wait = flag.Duration("wait", time.Duration(10)*time.Second,
-		"Time to wait between reconnection attempts.")
+		"Time to wait after a failed connection attempt or failed "+
+			"open of -pipe.")
 	gc.senddelay = flag.Duration("senddelay", time.Second, "Time to "+
 		"delay between lines sent to avoid flooding.")
 	gc.verbose = flag.Bool("verbose", false, "Print some non-error output.")
@@ -155,34 +193,26 @@ func mymain() int {
 		"this help text to a file.")
 	gc.rxproto = flag.Bool("rxproto", false, "Log received IRC protocol "+
 		"messages.")
+	gc.txlines = flag.Bool("txlines", false, "Log lines sent to IRC "+
+		"server")
 	flag.Parse()
+	debug("Local hostname: %v", n)
 
-	/* Only save the help */
+	/* Only save the help if requested */
 	if "" != *gc.savehelp {
 		return saveHelp(*gc.savehelp)
 	}
 
-	/* Seed the random number generator */
-	rand.Seed(time.Now().Unix())
+	/* Make sure the port is in the right range */
+	if *gc.port > math.MaxUint16 {
+		fmt.Printf("Port %v is larger than %v.\n", *gc.port,
+			math.MaxUint16)
+		return -3
+	}
 
 	/* Compile regular expressions */
-	gc.reNickInUse = regexp.MustCompile(reNickInUse)
-	gc.reChannelJoined = regexp.MustCompile(reChannelJoined)
-	gc.reNoNickGiven = regexp.MustCompile(reNoNickGiven)
-
-	/* Local hostname */
-	debug("Local hostname: %v", *gc.nick)
-
-	/* Save original nick */
-	gc.onick = *gc.nick
-
-	/* Work out the user */
-	gc.user = fmt.Sprintf("%v x x :%v", *gc.uname, *gc.rname)
-	debug("Initial user: %v", gc.user)
-
-	/* Work out address */
-	gc.addr = net.JoinHostPort(*gc.host, fmt.Sprintf("%v", *gc.port))
-	debug("Will connect to %v", gc.addr)
+	re.NickInUse = regexp.MustCompile(reNickInUse)
+	re.ChannelJoined = regexp.MustCompile(reChannelJoined)
 
 	/* Work out whether we should auth to services */
 	if "" != *gc.idnick || "" != *gc.idpass {
@@ -208,440 +238,262 @@ func mymain() int {
 		debug("Auth password: %v", *gc.idpass)
 	}
 
-	/* Open the pipe */
-	pname := "" /* Pipe name */
-	switch *gc.pipe {
-	case "-": /* stdin */
-		debug("Taking input from stdin")
-		gc.ipipe = textproto.NewReader(bufio.NewReader(os.Stdin))
-	case "nick": /* Name based on nick */
-		debug("Pipe based on nick")
-		pname = path.Join(os.TempDir(), *gc.nick) /* /tmp/nick */
-		fallthrough
-	default: /* User supplied name */
-		if "" == pname { /* Didn't fallthrough */
-			pname = *gc.pipe
-		}
-		debug("Pipe name: %v", pname)
-		/* Check and see if one exists */
-		fi, err := os.Stat(pname)
-		/* Nothing there */
-		if os.IsNotExist(err) {
-			debug("Pipe %v does not already exist, creating pipe",
-				pname)
-			if err := syscall.Mkfifo(pname, 0644); err != nil {
-				log.Printf("Unable to make %v: %v", pname, err)
-				return -3
-			}
-			/* Clean up fifo before we exit */
-			defer os.Remove(pname)
-		}
-		/* Check and see if one exists */
-		fi, err = os.Stat(pname)
-		/* Have a named pipe already */
-		if err == nil && (fi.Mode()&os.ModeNamedPipe != 0) {
-			debug("Pipe %v (now) exists", pname)
-			/* Flush the pipe, if required */
-			if *gc.flush {
-				/* Put data on the pipe in case it's empty */
-				cmd := forkSaveHelp(pname)
-				/* Open pipe to flush it */
-				debug("Opening %v for flushing", pname)
-				pn, err := os.Open(pname)
-				if err != nil {
-					log.Printf("Unable to open %v for "+
-						"flushing: %v", pname, err)
-					return -6
-				}
-				b := make([]byte, 2048) /* Read buffer */
-				/* Read from the pipe until it is empty */
-				for {
-					var e error
-					/* TODO: select here with timeout */
-					n, e := pn.Read(b)
-					if e == io.EOF {
-						break
-					} else if e != nil && e != io.EOF {
-						log.Printf("Error flushing "+
-							"%v: %v", pname, e)
-						return -7
-					}
-					debug("Read %v bytes flushing pipe", n)
-				}
-				debug("Waiting on pipe-filler to exit")
-				cmd.Wait()
-				/* Close the pipe */
-				if err := pn.Close(); err != nil {
-					log.Printf("Error closing %v: %v",
-						pname, err)
-					return -8
-				}
-
-			}
-			/* Try to open the pipe RW, to prevent EOFs */
-			f, e := os.OpenFile(pname, os.O_RDWR, 0600)
-			if e != nil {
-				log.Printf("Unable to open pipe named %v: %v",
-					pname, e)
-				return -1
-			}
-			gc.ipipe = textproto.NewReader(bufio.NewReader(f))
-			break
-		}
-		/* Something else is there */
-		log.Printf("Unable to use %v for input", pname)
-		return -2
+	/* SSL hostname, if not specified */
+	if *gc.ssl && "" == *gc.sslname {
+		*gc.sslname = *gc.host
 	}
 
-	/* Make the pipe read buffer */
-	gc.rbuf = make(chan string, 1)
-	/* Start the pipe reader */
-	go readPipe(gc.ipipe, gc.rbuf)
+	/* Channels (or channel-containing structs) for select */
+	var pipe *Pipe = nil
+
+	/* Kill IRC connection before exit */
+	defer func() {
+		if nil != irc {
+			verbose("Quitting IRC gracefully")
+			irc.Quit("")
+		}
+	}()
+
+	/* True if we need to make a new IRC or pipe */
+	newIRC := true
+	newPipe := true
+
+	/* Buffer for lines to be sent in case the connection dies */
+	var txbuf *string = nil
+
+	/* True when we're actually ready to send IRC messages */
+	ircReady := false
+
+	/* Nick from first IRC connection for use if -pname=nick */
+	onick := ""
 
 	/* Main program loop */
 	for {
-		/* Command to use to connect to server */
-		cmd := exec.Command("openssl", "s_client", "-quiet",
-			"-connect", gc.addr)
-		debug("Connection command: %v %v", cmd.Path, cmd.Args)
+		/* Get a channel for IRC messages */
+		if newIRC {
+			/* Not ready to send messages */
+			ircReady = false
 
-		/* Get ahold of i/o pipes */
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			log.Printf("Unable to get network input pipe: %v", err)
-			sleep()
-		}
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			log.Printf("Unable to get network output pipe: %v",
-				err)
-			sleep()
-		}
-
-		/* Turn into textproto i/o structs */
-		r := textproto.NewReader(bufio.NewReader(stdout))
-		w := textproto.NewWriter(bufio.NewWriter(stdin))
-
-		/* Connect to server */
-		debug("Connecting to %v", gc.addr)
-		if err := cmd.Start(); err != nil {
-			/* Retry again in a bit if we fail */
-			log.Printf("Retrying connection to %v in %v: %v",
-				gc.addr, *gc.wait, err)
-			sleep()
-			continue
-		}
-
-		/* Channel to communicate death from goroutines */
-		dc := make(chan int) /* 0 for ok, -1 for die */
-
-		/* Synchronize death */
-		done := killroutines.New()
-
-		/* Channel to signal writes to channel can start */
-		ready := make(chan string)
-
-		/* Start goroutines going */
-		go reader(r, w, dc, done, ready)
-		go sender(w, dc, done, ready)
-		go waiter(cmd, dc, done)
-
-		/* Set nick and user */
-		if !setNick(false, w) {
-			sleep()
-			continue
-		}
-
-		/* Wait for goroutines to end */
-		for i := 0; i < 3; i++ {
-			if n := <-dc; -1 == n {
-				/* Something bad happened */
-				return -4
-			}
-		}
-
-		/* Don't reconnect too fast */
-		sleep()
-	}
-}
-
-/* Goroutine to handle incoming messages */
-func reader(r *textproto.Reader, w *textproto.Writer, dc chan int,
-	done *killroutines.K, ready chan string) {
-	debug("Starting reader")
-
-	/* Channel to read from network */
-	c := make(chan string)
-	/* Read from the network into the channel */
-	go func() {
-		for {
-			/* Get a line */
-			l, err := r.ReadLine()
-			/* If there's a problem, signal a reconnect */
-			if err != nil {
-				log.Printf("Error reading from network")
-				close(c)
-				return
-			}
-			/* Print if desired */
+			/* Work out the prefixes */
+			txp := ""
+			rxp := ""
 			if *gc.rxproto {
-				log.Printf("IRC-> %v", l)
+				rxp = "IRC->"
 			}
-			/* Put the line on the channel */
-			c <- l
+			if *gc.txlines {
+				txp = "->IRC"
+			}
+			/* Try to connect and get a channel */
+			irc = minimalirc.New(
+				*gc.host, uint16(*gc.port), /* Server */
+				*gc.ssl, *gc.sslname, /* Use SSL (or not) */
+				*gc.nick, *gc.uname, *gc.rname) /* ID */
+			/* Numbers after the nick */
+			irc.RandomNumbers = *gc.nums
+			/* Auth */
+			irc.IdNick = *gc.idnick
+			irc.IdPass = *gc.idpass
+			/* Channel */
+			irc.Channel = *gc.channel
+			irc.Chanpass = *gc.chanpass
+			/* Log all messages */
+			irc.Txp = txp
+			irc.Rxp = rxp
+			/* Send pongs */
+			irc.Pongs = true
+			/* Quit message */
+			irc.QuitMessage = *gc.qmsg
+			/* If it fails, try again in a bit */
+			if err := irc.Connect(); nil != err {
+				verbose("Unable to connect to IRC server "+
+					"%v (retry in %v): %v",
+					*gc.host, *gc.wait, err)
+				newIRC = true
+				time.Sleep(*gc.wait)
+				continue
+			}
+			newIRC = false
 		}
-	}()
+		/* Get a channel for the pipe when IRC is ready */
+		if ircReady && (nil == pipe || newPipe) {
+			/* Get the real nick */
+			if "nick" == *gc.pipe && "" == onick {
+				/* Try to get the server's idea of the nick */
+				onick = irc.SNick()
+				/* If it fails, revert to the original nick */
+				if "" == onick {
+					onick = *gc.nick
+				}
+			}
 
-	/* Read lines until an error */
-	for {
-		l := "" /* Received line */
-		/* Get a line or be done */
-		select {
-		case <-done.Chan(): /* Time to die */
-			dc <- 0
-			return
-		case line, ok := <-c:
-			/* Handle errors */
-			if !ok {
-				/* If we have a read error, new connection */
-				done.Signal()
-				dc <- 0
-				return
+			var err error = nil
+			pipe, err = makePipe(*gc.pipe, onick, *gc.flush)
+			/* Retry if we have an error */
+			if nil != err {
+				verbose("Error opening pipe %v (retry in "+
+					"%v): %v", *gc.pipe, *gc.wait, err)
+				time.Sleep(*gc.wait)
+				newPipe = true
+				continue
 			}
-			l = line
+			debug("Using pipe: %v", pipe.Pname)
+			/* Remove pipe if we made it before exit */
+			if "nick" == *gc.pipe {
+				rempname = pipe.Pname
+			}
 		}
-		/* Handle incoming messages */
-		switch {
-		case strings.HasPrefix(strings.ToLower(l), "ping "): /* Ping */
-			reply := fmt.Sprintf("PONG ", l[5:])
-			w.PrintfLine(reply)
-			debug("Sent ping reply: %v", reply)
-		case gc.reNickInUse.MatchString(l): /* Nick is in use */
-			verbose("Nick %v in use, trying a new one", *gc.nick)
-			/* Set a new nick */
-			if !setNick(true, w) {
-				done.Signal()
-				dc <- 0
-				return
+
+		/* Try to send txbuf before the select */
+		if nil != txbuf {
+			if err := irc.Privmsg(*txbuf, ""); nil != err {
+				verbose("Error sending buffered message: %v",
+					err)
 			}
-		case gc.reChannelJoined.MatchString(l): /* Channel's joined */
-			verbose("Joined %v", *gc.channel)
-			close(ready)
-		case gc.reNoNickGiven.MatchString(l): /* No Nick was given */
-			/* Extract the nick */
-			m := gc.reNoNickGiven.FindStringSubmatch(l)
-			/* Make sure we have it */
-			if 2 != len(m) {
-				verbose("Error processing \"No nickname " +
-					"given\" message")
-			}
-			/* Save the nick given by the server */
-			gc.snick = m[1]
-			verbose("Nick is %v", gc.snick)
+			/* Try again in a bit */
+			newIRC = true
+			continue
+		}
+
+		/* Handle an event */
+		newPipe, newIRC, ircReady, txbuf, err = handleEvent(pipe, irc,
+			ircReady, txbuf)
+		if io.EOF == err && nil != pipe && "-" == pipe.Pname {
+			/* End of stdin */
+			return 0
+		} else if err != nil {
+			verbose("Error handling an event: %v", err)
+			return -1
 		}
 	}
 }
 
-/* Goroutine to handle outgoing messages.  cv is a condition variable that
-wakes us up when sending is ready (after a channel join and so on, cs tells
-us it's ok to send (can send). */
-func sender(w *textproto.Writer, dc chan int, done *killroutines.K,
-	ready chan string) {
-	debug("Started sender")
-	defer debug("No longer sending")
-	/* Closure to send a line.  Returns true if we should return */
-	send := func(l string) {
-		/* Put the line in the buffer */
-		gc.txbuf = &l
-		/* Send the line */
-		if err := w.PrintfLine("PRIVMSG %v :%s", *gc.channel,
-			/* If it failed, start the reconnect process */
-			*gc.txbuf); err != nil {
-			verbose("Unable to send line: %v", err)
-			done.Signal()
-			dc <- 0
-			return
-		} else {
-			/* If it worked, empty the buf for next time */
-			gc.txbuf = nil
-		}
+/* Wait for something to happen, handle it */
+func handleEvent(pipe *Pipe, irc *minimalirc.IRC, iircReady bool,
+	itxbuf *string) (newPipe bool, newIRC bool,
+	ircReady bool, txbuf *string, err error) {
+
+	/* We actually use output arguments */
+	ircReady = iircReady
+	txbuf = itxbuf
+
+	/* Set the pipe channel in the select to nil if we've not yet got in
+	the IRC channel */
+	var p <-chan string
+	if !ircReady || nil == pipe {
+		p = nil
+	} else {
+		p = pipe.R
 	}
-	/* Wait for writing to be allowable or the signal to return */
+
+	/* KQueueish select */
 	select {
-	case <-done.Chan(): /* Time to exit */
-		debug("Sender dying before it started")
-		dc <- 0
-		return
-	case <-ready: /* In channel, ready to send */
-		debug("Sender can send")
-	}
-
-	/* First try to send the txbuf now that we can send */
-	if nil != gc.txbuf {
-		debug("Sending TX buffer: %v", *gc.txbuf)
-		send(*gc.txbuf)
-	}
-
-	/* Set up reads from r */
-	for {
-		select {
-		case line, ok := <-gc.rbuf: /* Received a line */
-			if !ok { /* Error */
-				done.Signal()
-				dc <- -1
-				return
+	case l, ok := <-p: /* Line to send */
+		/* Handle a closed pipe */
+		if !ok {
+			err = <-pipe.E
+			/* If it's stdin's EOF, we're done */
+			if "-" == pipe.Pname && io.EOF == err {
+				break
 			}
-			/* Remove needless whitespace */
-			line = strings.TrimRightFunc(line, unicode.IsSpace)
-			gc.txbuf = &line
-			debug("Will send line: %v", *gc.txbuf)
-			/* Send the line */
-			if err := w.PrintfLine("PRIVMSG %v :%s", *gc.channel,
-				*gc.txbuf); err != nil {
-				verbose("Unable to send line: %v", err)
-				done.Signal()
-				dc <- 0
-				return
+			err = errors.New(fmt.Sprintf("Error reading from "+
+				"pipe: %v", err))
+			newPipe = true
+		}
+		/* Store the line in the TX buffer */
+		txbuf = &l
+
+		/* Work out the max size of a message */
+		max := irc.PrivmsgSize("")
+
+		/* Put the strings into an array */
+		txarr := ArrayOfShortStrings(l, max)
+
+		/* Send message to IRC server */
+		for _, m := range txarr {
+			if err = irc.Privmsg(m, ""); nil != err {
+				err = errors.New(fmt.Sprintf("Error sending "+
+					"message: %v", err))
+				irc.Quit("")
+				newIRC = true
+				break
 			}
-			/* If it worked, empty the buf for next time */
-			gc.txbuf = nil
+			/* Delay after sending a picture */
 			time.Sleep(*gc.senddelay)
-		case <-done.Chan(): /* We're meant to stop */
-			dc <- 0
-			return
+		}
+		/* If the message(s) sent ok, clear the TX buffer and sleep to
+		avoid flooding. */
+		if nil == err {
+			txbuf = nil
+			/* Sleep a bit to avoid flooding */
+			time.Sleep(*gc.senddelay)
+		}
+	case l, ok := <-irc.C: /* Message from IRC server */
+		/* Check if connection died */
+		if !ok {
+			/* Get the error */
+			err := <-irc.E
+			/* Try to close the connection, for just in
+			case */
+			if e := irc.Quit(*gc.qmsg); e != nil {
+				debug("Error closing connection to "+
+					"the IRC server: %v", e)
+			}
+			verbose("IRC server error (reconnect in "+
+				"%v): %v", *gc.wait, err)
+			/* Signal to make a new one next time */
+			newIRC = true
+		}
+		/* Check if we've joined a channel */
+		if re.ChannelJoined.MatchString(l) {
+			debug("Joined a channel: %v", l)
+			ircReady = true
+		}
+		/* Retry the nick if it's in use */
+		if re.NickInUse.MatchString(l) {
+			verbose("Nick is in use, will try another")
+			irc.RandomNumbers = true
+			if err = irc.Handshake(); err != nil {
+				err = errors.New(fmt.Sprintf("unable to "+
+					"retry handshake: %v", err))
+				newIRC = true
+				break
+			}
 		}
 	}
-}
-
-/* readPipe reads lines from r and sends them to c */
-func readPipe(r *textproto.Reader, c chan string) {
-	debug("Reading from a pipe into a channel")
-	defer debug("No longer reading from the pipe.")
-	/* Wait for a line or c to close */
-	for {
-		l, err := r.ReadLine()
-		/* Close c to signal an error */
-		if err != nil {
-			/* TODO: Work out if we really need to exit */
-			log.Printf("Error getting line to send: %v",
-				err)
-			close(c)
-			return
-		}
-		/* Send the read line out */
-		c <- l
-	}
-}
-
-/* Wait for a process to die */
-func waiter(c *exec.Cmd, dc chan int, done *killroutines.K) {
-	debug("Started waiter")
-	defer debug("Waited")
-	wc := make(chan int)
-	go func() {
-		if err := c.Wait(); err != nil {
-			log.Printf("openssl exited badly: %v", err)
-		}
-		close(wc)
-	}()
-	/* Wait for openssl to die */
-	select {
-	case <-wc: /* OpenSSL died */
-		/* Tell the other goroutines to die */
-		done.Signal()
-	case <-done.Chan(): /* We should die */
-		/* Stop OpenSSL */
-		debug("Killing OpenSSL (pid %v)", c.Process.Pid)
-		if err := c.Process.Kill(); err != nil {
-			log.Printf("Unable to kill OpenSSL (pid %v): %v",
-				c.Process.Pid, err)
-		}
-	}
-	dc <- 0
 	return
 }
 
-/* makeNick makes a new nick with numbers.  n overrides *gc.nums */
-func setNick(n bool, w *textproto.Writer) bool {
-	/* Add numbers if needed */
-	if *gc.nums || n {
-		*gc.nick = fmt.Sprintf("%v-%v", gc.onick, rand.Int63())
+/* ArrayOfShortStrings splits s into an array of strings of length no more than
+l bytes, keeping runes together. */
+func ArrayOfShortStrings(s string, l int) []string {
+	/* Easy case, string fits */
+	if len(s) <= l {
+		return []string{s}
 	}
-
-	/* Tell the user what the nick is */
-	nick := fmt.Sprintf("NICK %v\n", *gc.nick)
-	verbose("Setting nick: %v", *gc.nick)
-	/* Set the nick */
-	if err := w.PrintfLine(nick); err != nil {
-		log.Printf("Error setting nick: %v", err)
-		return false
-	}
-
-	/* Set the user */
-	u := fmt.Sprintf("USER %v", gc.user)
-	debug("Setting user: %v", u)
-	if err := w.PrintfLine(u); err != nil {
-		log.Printf("Error setting user: %v", err)
-		return false
-	}
-
-	/* Auth to services */
-	if "" != *gc.idnick && "" != *gc.idpass {
-		verbose("Authenticating to services")
-		if err := w.PrintfLine("PRIVMSG nickserv :identify %v %v",
-			*gc.idnick, *gc.idpass); err != nil {
-			log.Printf("Error authenticating to services: %v")
-			return false
+	/* Come up with a guess for the number of smaller strings */
+	nsmaller := int(math.Ceil(float64(len(s) / l)))
+	/* Make an array with a capacity of double that, just in case */
+	o := make([]string, 0, 2*nsmaller)
+	/* Split s into runes */
+	r := []rune(s)
+	/* Working string */
+	w := ""
+	/* Index to r */
+	for i := 0; i < len(r); i++ {
+		/* If rune is larger than the string size, replace with ? */
+		if len(string(r[i])) > l {
+			r[i] = '?'
 		}
+		/* If adding the current rune to the current string would be
+		too big, save it and start a new one */
+		if len(w+string(r[i])) > l {
+			o = append(o, w)
+			w = ""
+		}
+		w += string(r[i])
 	}
-
-	/* Join Channel */
-	c := fmt.Sprintf("JOIN %v %v", *gc.channel, *gc.chanpass)
-	debug("Joining channel: %v", c)
-	if err := w.PrintfLine(c); err != nil {
-		log.Printf("Error requesting to join channel %v: %v", err)
-		return false
-	}
-
-	/* Send an erroneous nick command, to get our own for sure */
-	debug("Requesting nick with erroneous NICK command")
-	if err := w.PrintfLine("NICK"); err != nil {
-		log.Printf("Unable to send intentionally erroneous NICK "+
-			"command: err", err)
-		return false
-	}
-	return true
-}
-
-/* saveHelp writes the help text to a file */
-func saveHelp(fname string) int {
-	/* Open output file */
-	f, err := os.Create(fname)
-	if err != nil {
-		fmt.Printf("Unable to open %v to write help text: %v\n", fname,
-			err)
-		return -9
-	}
-	debug("Opened %v for saving help", fname)
-	flag.CommandLine.SetOutput(f)
-	debug("Set output to %v", f)
-	flag.PrintDefaults()
-	debug("Saved help text to %v", fname)
-	return 0
-}
-
-/* forkSaveHelp writes the help data to the specified file. */
-func forkSaveHelp(fname string) *exec.Cmd {
-	/* Make a command out of ourselves */
-	c := exec.Command(os.Args[0], "-savehelp", fname)
-	/* Run the command */
-	debug("Running %v to have data to flush from %v", c.Args, fname)
-	err := c.Start()
-	if err != nil {
-		fmt.Printf("Error putting data into %v for flushing: %v",
-			fname, err)
-	}
-	return c
+	/* Append the final working string */
+	return append(o, w)
 }
 
 /* Verbose and debug output */
@@ -655,10 +507,4 @@ func verbose(f string, a ...interface{}) {
 	if *gc.verbose || *gc.debug {
 		log.Printf(f, a...)
 	}
-}
-
-/* sleep sleeps the required amount of time before a reconnect */
-func sleep() {
-	log.Printf("Sleeping %v before reconnect", *gc.wait)
-	time.Sleep(*gc.wait)
 }
