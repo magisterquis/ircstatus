@@ -188,7 +188,8 @@ func mymain() int {
 		"delay between lines sent to avoid flooding.")
 	gc.verbose = flag.Bool("verbose", false, "Print some non-error output.")
 	gc.debug = flag.Bool("debug", false, "Print more non-error "+
-		"output.  Implies -verbose.")
+		"output.  Implies -verbose.  This should be used with care "+
+		"as it could leak passwords.")
 	gc.savehelp = flag.String("savehelp", "", "Does nothing but write "+
 		"this help text to a file.")
 	gc.rxproto = flag.Bool("rxproto", false, "Log received IRC protocol "+
