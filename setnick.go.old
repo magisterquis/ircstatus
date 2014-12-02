@@ -1,0 +1,55 @@
+package main
+
+/* setNick sends the USER and NICK commands, auths to services, joins the
+channel, and sends an intentionally eroneous NICK command (to catch the
+server's idea of our nick later) to w.  nums controls whether or not random
+numbers are added to the nick.  To skip authenticating, username and realname
+should be empty strings. */
+func setNick(nick string, nums bool, username, realname string, authnick, authpass, string, w *textproto.Writer) error {
+	/* Add numbers if needed */
+	if nums {
+		nick = fmt.Sprintf("%v-%v", nck, rand.Int63())
+	}
+
+	/* Set the nick */
+	verbose("Setting nick: %v", nick)
+	if err := w.PrintfLine("NICK :%v", nick); err != nil {
+		log.Printf("Error setting nick: %v", err)
+		return err
+	}
+
+	/* Set the user */
+	u := fmt.Sprintf("USER %v x x :%v", username, realname)
+	debug("Setting user: %v", u)
+	if err := w.PrintfLine(u); err != nil {
+		log.Printf("Error setting user: %v", err)
+		return err
+	}
+
+	/* Auth to services */
+	if "" != authnick && "" != authpass {
+		verbose("Authenticating to services")
+		if err := w.PrintfLine("PRIVMSG nickserv :identify %v %v",
+			authnick, authpass); err != nil {
+			log.Printf("Error authenticating to services: %v")
+			return err
+		}
+	}
+
+	/* Join Channel */
+	c := fmt.Sprintf("JOIN %v %v", *gc.channel, *gc.chanpass)
+	debug("Joining channel: %v", c)
+	if err := w.PrintfLine(c); err != nil {
+		log.Printf("Error requesting to join channel %v: %v", err)
+		return err
+	}
+
+	/* Send an erroneous nick command, to get our own for sure */
+	debug("Requesting nick with erroneous NICK command")
+	if err := w.PrintfLine("NICK"); err != nil {
+		log.Printf("Unable to send intentionally erroneous NICK "+
+			"command: err", err)
+		return err
+	}
+	return nil
+}
