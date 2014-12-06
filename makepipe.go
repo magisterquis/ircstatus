@@ -118,6 +118,8 @@ func makePipe(pname, nick string, flush bool) (*Pipe, error) {
 							p.Pname, err)
 					}
 				}
+				/* Don't send on the closed channel */
+				return
 			}
 			/* Send out the line */
 			p.r <- line
