@@ -214,7 +214,7 @@ func flushBytes(r *os.File) <-chan error {
 	c := make(chan error, 1)
 	go func() {
 		/* Read buffer */
-		b := make([]byte, 2048)
+		b := make([]byte, 4096)
 		/* Get some bytes */
 		n, err := r.Read(b)
 		/* Report how many */
