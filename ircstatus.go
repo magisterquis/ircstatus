@@ -195,7 +195,7 @@ func mymain() int {
 		"this help text to a file.")
 	gc.rxproto = flag.Bool("rxproto", false, "Log received IRC protocol "+
 		"messages.")
-	gc.timeout = flag.Duration("timeout", 2*time.Minute, "Reconnect to "+
+	gc.timeout = flag.Duration("timeout", 3*time.Minute, "Reconnect to "+
 		"the IRC server if no messages has been received in this long.")
 	gc.txlines = flag.Bool("txlines", false, "Log lines sent to IRC "+
 		"server")
