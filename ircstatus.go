@@ -71,6 +71,7 @@ var gc struct {
 	debug     *bool          /* Debug output */
 	rxproto   *bool          /* Print received received IRC messages */
 	txlines   *bool          /* Print lines sent to IRC server */
+	timeout   *time.Duration /* IRC timeout */
 	savehelp  *string        /* Filename to which to save help text */
 }
 
@@ -194,6 +195,8 @@ func mymain() int {
 		"this help text to a file.")
 	gc.rxproto = flag.Bool("rxproto", false, "Log received IRC protocol "+
 		"messages.")
+	gc.timeout = flag.Duration("timeout", 2*time.Minute, "Reconnect to "+
+		"the IRC server if no messages has been received in this long.")
 	gc.txlines = flag.Bool("txlines", false, "Log lines sent to IRC "+
 		"server")
 	flag.Parse()
@@ -308,6 +311,8 @@ func mymain() int {
 			irc.Pongs = true
 			/* Quit message */
 			irc.QuitMessage = *gc.qmsg
+			/* Set our own idea of pings */
+			irc.Timeout = *gc.timeout
 			/* If it fails, try again in a bit */
 			if err := irc.Connect(); nil != err {
 				verbose("Unable to connect to IRC server "+
