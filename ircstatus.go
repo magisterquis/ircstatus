@@ -311,8 +311,6 @@ func mymain() int {
 			irc.Pongs = true
 			/* Quit message */
 			irc.QuitMessage = *gc.qmsg
-			/* Set our own idea of pings */
-			irc.Timeout = *gc.timeout
 			/* If it fails, try again in a bit */
 			if err := irc.Connect(); nil != err {
 				verbose("Unable to connect to IRC server "+
